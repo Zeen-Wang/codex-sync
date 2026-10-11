@@ -329,12 +329,16 @@ func (c *Config) IsLegacyConfig() bool {
 // the next push. If a custom list shares nothing with the scope, the scope
 // defaults are used instead.
 func (c *Config) GetEffectiveSyncPaths() []string {
-	scoped := ScopedSyncPaths(c.Scope)
+	scope := c.Scope
+	if c.GetStorageConfig().Provider == storage.ProviderICloud {
+		scope = ScopeSessions
+	}
+	scoped := ScopedSyncPaths(scope)
 	if len(c.SyncPaths) == 0 {
 		return scoped
 	}
 
-	if c.Scope != ScopeSessions {
+	if scope != ScopeSessions {
 		return c.SyncPaths
 	}
 
@@ -361,6 +365,18 @@ func (c *Config) GetEffectiveSyncPaths() []string {
 // matches a user exclude pattern.
 func (c *Config) IsExcluded(relPath string) bool {
 	relPath = filepath.ToSlash(relPath)
+	if c.GetStorageConfig().Provider == storage.ProviderICloud {
+		allowed := false
+		for _, p := range SessionSyncPaths {
+			if relPath == p || strings.HasPrefix(relPath, p+"/") {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return true
+		}
+	}
 	if IsHardExcluded(relPath) {
 		return true
 	}

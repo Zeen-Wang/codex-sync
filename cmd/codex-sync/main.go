@@ -74,6 +74,7 @@ func main() {
 		changelogCmd(),
 		pathsCmd(),
 		desktopCmd(),
+		icloudCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -142,7 +143,7 @@ func reportSyncErrors(cmd *cobra.Command, w io.Writer, errs []error) error {
 }
 
 func initCmd() *cobra.Command {
-	var provider, bucket string
+	var provider, bucket, sharedFolder string
 	var scope string
 	var usePassphrase, force bool
 
@@ -172,6 +173,7 @@ Supported providers:
   - s3:            Amazon S3
   - gcs:           Google Cloud Storage
   - s3-compatible: Any S3-compatible provider via custom endpoint (Backblaze B2, MinIO, Wasabi, ...)
+  - icloud:        Existing iCloud Drive shared folder (sessions only)
   - webdav:        WebDAV (Nextcloud, ownCloud, etc. - self-hosted)
 
 Examples:
@@ -192,12 +194,13 @@ Examples:
 			}
 
 			// Normal flow: full setup
-			return initFullSetup(ctx, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, s3Endpoint, s3UsePathStyle, gcsProjectID, gcsCredentialsFile, webdavURL, webdavUsername, webdavPassword, webdavPathPrefix, scope, usePassphrase, force)
+			return initFullSetup(ctx, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, s3Endpoint, s3UsePathStyle, gcsProjectID, gcsCredentialsFile, webdavURL, webdavUsername, webdavPassword, webdavPathPrefix, scope, sharedFolder, usePassphrase, force)
 		},
 	}
 
 	// Provider selection
-	cmd.Flags().StringVar(&provider, "provider", "", "Storage provider: r2, s3, gcs, s3-compatible, or webdav")
+	cmd.Flags().StringVar(&provider, "provider", "", "Storage provider: r2, s3, gcs, s3-compatible, webdav, or icloud")
+	cmd.Flags().StringVar(&sharedFolder, "shared-folder", "", "Existing dedicated iCloud Drive shared folder (local path on this Mac)")
 	cmd.Flags().StringVar(&scope, "scope", "", "Sync scope: 'full' (default: sessions + config, rules, skills, memories) or 'sessions' (conversation data only)")
 	cmd.Flags().StringVar(&bucket, "bucket", "", "Bucket name")
 	cmd.Flags().BoolVar(&usePassphrase, "passphrase", false, "Derive encryption key from passphrase")
@@ -298,7 +301,7 @@ func resolveScope(scope string) (string, error) {
 }
 
 // initFullSetup handles the full init wizard
-func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, s3Endpoint string, s3UsePathStyle bool, gcsProjectID, gcsCredentialsFile, webdavURL, webdavUsername, webdavPassword, webdavPathPrefix, scope string, usePassphrase, force bool) error {
+func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, accessKey, secretKey, s3Region, s3Endpoint string, s3UsePathStyle bool, gcsProjectID, gcsCredentialsFile, webdavURL, webdavUsername, webdavPassword, webdavPathPrefix, scope, sharedFolder string, usePassphrase, force bool) error {
 	if config.Exists() && !force {
 		var overwrite bool
 		prompt := &survey.Confirm{
@@ -325,6 +328,7 @@ func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, ac
 				"Google Cloud Storage",
 				"S3-compatible (custom endpoint) — Backblaze B2, MinIO, Wasabi, ...",
 				"WebDAV (Nextcloud, ownCloud, etc. - self-hosted)",
+				"iCloud Drive shared folder (sessions only)",
 			},
 		}
 		var choice int
@@ -342,6 +346,8 @@ func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, ac
 			provider = "s3-compatible"
 		case 4:
 			provider = "webdav"
+		case 5:
+			provider = "icloud"
 		}
 	}
 
@@ -350,6 +356,12 @@ func initFullSetup(ctx context.Context, keyPath, provider, bucket, accountID, ac
 	fmt.Println()
 
 	switch provider {
+	case "icloud":
+		if scope != "" && scope != config.ScopeSessions {
+			return fmt.Errorf("iCloud requires --scope sessions to preserve account separation")
+		}
+		scope = config.ScopeSessions
+		storageCfg, err = runICloudWizard(sharedFolder)
 	case "r2":
 		storageCfg, err = runR2Wizard(accountID, accessKey, secretKey, bucket)
 	case "s3":
@@ -459,7 +471,9 @@ skipKeyGen:
 		}
 		return fmt.Errorf("bucket '%s' does not exist. Please create it first in your storage provider's console.\n  For R2: https://dash.cloudflare.com/ → R2 → Create bucket\n  For S3: https://console.aws.amazon.com/s3/ → Create bucket (use 'automatic' location)\n  For GCS: https://console.cloud.google.com/storage/ → Create bucket", storageCfg.Bucket)
 	}
-	if storageCfg.Provider == storage.ProviderWebDAV {
+	if storageCfg.Provider == storage.ProviderICloud {
+		printSuccess("Opened shared folder: " + storageCfg.SharedFolder)
+	} else if storageCfg.Provider == storage.ProviderWebDAV {
 		printSuccess("Connected to WebDAV ('" + storageCfg.PathPrefix + "')")
 	} else {
 		printSuccess("Connected to '" + storageCfg.Bucket + "'")
@@ -557,6 +571,13 @@ func enterPassphraseAndVerify(ctx context.Context, store storage.Storage, keyPat
 			break
 		}
 
+		if isICloudStore(store) {
+			if err := deriveICloudKey(ctx, store, keyPath, passphrase); err != nil {
+				return false, err
+			}
+			printSuccess("Key derived and verified against locally available revisions")
+			return false, nil
+		}
 		if err := crypto.GenerateKeyFromPassphrase(keyPath, passphrase); err != nil {
 			return false, fmt.Errorf("failed to generate key: %w", err)
 		}
@@ -1850,6 +1871,15 @@ Examples:
   codex-sync reset            # Remove local config, key and sync state
   codex-sync reset --remote   # Also delete all files from cloud storage`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if clearRemote {
+				cfg, err := config.Load()
+				if err != nil {
+					return err
+				}
+				if cfg.GetStorageConfig().Provider == storage.ProviderICloud {
+					return fmt.Errorf("iCloud remote reset is disabled; local config, key and state were kept")
+				}
+			}
 			reader := bufio.NewReader(os.Stdin)
 
 			fmt.Println()

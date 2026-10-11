@@ -15,6 +15,7 @@ const (
 	ProviderS3     Provider = "s3"
 	ProviderGCS    Provider = "gcs"
 	ProviderWebDAV Provider = "webdav"
+	ProviderICloud Provider = "icloud"
 )
 
 // MaxDownloadSize is the maximum allowed size for a single downloaded object (100MB).
@@ -97,6 +98,8 @@ func New(cfg *StorageConfig) (Storage, error) {
 		return NewGCS(cfg)
 	case ProviderWebDAV:
 		return NewWebDAV(cfg)
+	case ProviderICloud:
+		return NewICloud(cfg)
 	default:
 		return nil, fmt.Errorf("unsupported storage provider: %s", cfg.Provider)
 	}
@@ -113,3 +116,23 @@ var NewGCS func(cfg *StorageConfig) (Storage, error)
 
 // NewWebDAV creates a new WebDAV storage adapter (implemented in webdav/webdav.go)
 var NewWebDAV func(cfg *StorageConfig) (Storage, error)
+
+// NewICloud constructs the append-only shared-folder adapter.
+var NewICloud func(cfg *StorageConfig) (Storage, error)
+
+// RevisionUploader publishes against the locally visible revision and returns
+// the exact version written. It does not imply distributed cloud locking.
+type RevisionUploader interface {
+	UploadRevision(ctx context.Context, key string, data []byte, expected string) (string, error)
+}
+
+// RevisionDownloader reads the immutable revision from a listing, avoiding a
+// race between listing an object and recording downloaded bytes in sync state.
+type RevisionDownloader interface {
+	DownloadRevision(ctx context.Context, key, version string) ([]byte, error)
+}
+
+// OperationLocker provides local process exclusion, not a distributed lock.
+type OperationLocker interface {
+	Lock(context.Context) (func(), error)
+}

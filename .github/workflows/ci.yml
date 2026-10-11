@@ -31,6 +31,7 @@ jobs:
             ./internal/desktop/ \
             ./internal/paths/ \
             ./internal/storage/ \
+            ./internal/storage/icloud/ \
             ./internal/sync/ \
             ./internal/util/
 

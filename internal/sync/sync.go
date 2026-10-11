@@ -22,6 +22,7 @@ import (
 
 	// Register storage adapters
 	_ "github.com/d-jiao/codex-sync/internal/storage/gcs"
+	_ "github.com/d-jiao/codex-sync/internal/storage/icloud"
 	_ "github.com/d-jiao/codex-sync/internal/storage/r2"
 	_ "github.com/d-jiao/codex-sync/internal/storage/s3"
 )
@@ -102,6 +103,9 @@ type ProgressEvent struct {
 type ProgressFunc func(event ProgressEvent)
 
 func NewSyncer(cfg *config.Config, quiet bool) (*Syncer, error) {
+	if err := cfg.ValidateICloudPaths(); err != nil {
+		return nil, err
+	}
 	storageCfg := cfg.GetStorageConfig()
 	store, err := storage.New(storageCfg)
 	if err != nil {
@@ -197,6 +201,9 @@ func (s *Syncer) syncPaths() []string {
 
 // Scope returns the configured sync scope (empty means the default "full").
 func (s *Syncer) Scope() string {
+	if s.isICloud() {
+		return config.ScopeSessions
+	}
 	return s.cfg.Scope
 }
 
@@ -214,7 +221,22 @@ func (s *Syncer) log(format string, args ...interface{}) {
 }
 
 func (s *Syncer) Push(ctx context.Context) (*SyncResult, error) {
+	if locker, ok := s.storage.(storage.OperationLocker); ok {
+		release, err := locker.Lock(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+	}
 	result := &SyncResult{}
+	if s.isICloud() {
+		if _, err := s.storage.List(ctx, ""); err != nil {
+			return nil, err
+		}
+	}
+	if s.isICloud() && s.allowRemoteDeletes {
+		return nil, fmt.Errorf("iCloud does not support push --force: remote deletion is unsafe")
+	}
 
 	s.progress(ProgressEvent{Action: "scan", Path: "Detecting changes..."})
 
@@ -448,6 +470,13 @@ func (s *Syncer) copyToRemoteTrash(ctx context.Context, key, batch string) error
 }
 
 func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
+	if locker, ok := s.storage.(storage.OperationLocker); ok {
+		release, err := locker.Lock(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+	}
 	result := &SyncResult{}
 
 	s.progress(ProgressEvent{Action: "scan", Path: "Fetching remote file list..."})
@@ -480,6 +509,19 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 	for _, key := range skipped {
 		result.Errors = append(result.Errors,
 			fmt.Errorf("%s: unknown path token; add the matching path_map entry on this device", key))
+	}
+
+	// An old but internally consistent replica must not roll a session back
+	// after this device has already observed a newer immutable revision.
+	if reader, ok := s.storage.(storage.RevisionDownloader); ok {
+		for rel, obj := range remoteFiles {
+			previous := s.state.GetFile(rel)
+			if previous != nil && previous.RemoteVersion != "" && previous.RemoteVersion != obj.Version {
+				if _, err := reader.DownloadRevision(ctx, obj.Key, previous.RemoteVersion); err != nil {
+					return nil, fmt.Errorf("previously seen revision for %s is unavailable; wait for iCloud downloads: %w", rel, err)
+				}
+			}
+		}
 	}
 
 	// Get current local files
@@ -598,7 +640,7 @@ func (s *Syncer) Pull(ctx context.Context) (*SyncResult, error) {
 	// Files that vanished from the remote (deleted or moved on another machine)
 	// are moved to the trash when unchanged locally; never when this pull saw an
 	// empty remote (Pull returned early above).
-	if !s.noDelete {
+	if !s.noDelete && !s.isICloud() {
 		removable, kept, err := s.staleLocalFiles(remoteFiles, localFiles)
 		if err != nil {
 			result.Errors = append(result.Errors, err)
@@ -668,7 +710,17 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 
 	// Upload
 	remoteKey := s.remoteKey(relativePath)
-	if err := s.storage.Upload(ctx, remoteKey, encrypted); err != nil {
+	var writtenVersion string
+	if uploader, ok := s.storage.(storage.RevisionUploader); ok {
+		expected, err := s.expectedRevision(ctx, relativePath, remoteKey)
+		if err != nil {
+			return err
+		}
+		writtenVersion, err = uploader.UploadRevision(ctx, remoteKey, encrypted, expected)
+		if err != nil {
+			return fmt.Errorf("failed to upload: %w", err)
+		}
+	} else if err := s.storage.Upload(ctx, remoteKey, encrypted); err != nil {
 		return fmt.Errorf("failed to upload: %w", err)
 	}
 
@@ -688,11 +740,13 @@ func (s *Syncer) uploadFile(ctx context.Context, relativePath string) error {
 	// Record the later of the two so this upload never looks newer than
 	// "uploaded" to the next pull, which would re-download identical bytes.
 	uploadedAt := time.Now()
-	var remoteVersion string
-	if hdr, err := s.storage.Head(ctx, remoteKey); err == nil && hdr != nil {
-		remoteVersion = hdr.Version
-		if hdr.LastModified.After(uploadedAt) {
-			uploadedAt = hdr.LastModified
+	remoteVersion := writtenVersion
+	if writtenVersion == "" {
+		if hdr, err := s.storage.Head(ctx, remoteKey); err == nil && hdr != nil {
+			remoteVersion = hdr.Version
+			if hdr.LastModified.After(uploadedAt) {
+				uploadedAt = hdr.LastModified
+			}
 		}
 	}
 
@@ -719,8 +773,14 @@ func remoteChanged(remote storage.ObjectInfo, state *FileState) bool {
 }
 
 // fetchRemote downloads, decrypts, decompresses and de-tokenizes one remote object.
-func (s *Syncer) fetchRemote(ctx context.Context, relativePath, remoteKey string) ([]byte, error) {
-	encrypted, err := s.storage.Download(ctx, remoteKey)
+func (s *Syncer) fetchRemote(ctx context.Context, relativePath, remoteKey string, version ...string) ([]byte, error) {
+	var encrypted []byte
+	var err error
+	if reader, ok := s.storage.(storage.RevisionDownloader); ok && len(version) > 0 {
+		encrypted, err = reader.DownloadRevision(ctx, remoteKey, version[0])
+	} else {
+		encrypted, err = s.storage.Download(ctx, remoteKey)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("failed to download: %w", err)
 	}
@@ -746,7 +806,7 @@ func (s *Syncer) downloadFile(ctx context.Context, relativePath string, remote s
 	if config.IsProtected(relativePath) {
 		return fmt.Errorf("refusing to write protected file %s", relativePath)
 	}
-	data, err := s.fetchRemote(ctx, relativePath, remote.Key)
+	data, err := s.fetchRemote(ctx, relativePath, remote.Key, remote.Version)
 	if err != nil {
 		return err
 	}
@@ -893,7 +953,7 @@ func (s *Syncer) mergeRemote(ctx context.Context, relativePath string, remoteObj
 	if stateFile != nil && localExists && !remoteChanged(remoteObj, stateFile) {
 		return false, nil // remote unchanged since we last merged it
 	}
-	remoteData, err := s.fetchRemote(ctx, relativePath, remoteObj.Key)
+	remoteData, err := s.fetchRemote(ctx, relativePath, remoteObj.Key, remoteObj.Version)
 	if err != nil {
 		return false, err
 	}
@@ -1214,7 +1274,7 @@ func (s *Syncer) PreviewPull(ctx context.Context) (*PullPreview, error) {
 		}
 	}
 
-	if len(remoteObjects) > 0 && !s.noDelete {
+	if len(remoteObjects) > 0 && !s.noDelete && !s.isICloud() {
 		removable, kept, err := s.staleLocalFiles(remoteFiles, localFiles)
 		if err != nil {
 			return nil, err
@@ -1355,4 +1415,35 @@ func gzipDecompress(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("decompressed data exceeds %d bytes limit", maxDecompressedSize)
 	}
 	return result, nil
+}
+
+func (s *Syncer) isICloud() bool { return s.cfg.GetStorageConfig().Provider == storage.ProviderICloud }
+
+// A resolved sidecar may record the remote hash with an older revision. Verify
+// those exact bytes before adopting the new parent; never silently replace data.
+func (s *Syncer) expectedRevision(ctx context.Context, rel, key string) (string, error) {
+	previous := s.state.GetFile(rel)
+	head, err := s.storage.Head(ctx, key)
+	if errors.Is(err, os.ErrNotExist) {
+		if previous != nil && previous.RemoteVersion != "" {
+			return "", fmt.Errorf("iCloud revision missing for %s; wait for Finder synchronization", rel)
+		}
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if previous != nil {
+		if previous.RemoteVersion == head.Version {
+			return head.Version, nil
+		}
+		data, err := s.fetchRemote(ctx, rel, key, head.Version)
+		if err != nil {
+			return "", err
+		}
+		if hashBytes(data) == previous.Hash {
+			return head.Version, nil
+		}
+	}
+	return "", fmt.Errorf("%w: %s; pull and resolve conflicts before pushing", storage.ErrPreconditionFailed, rel)
 }

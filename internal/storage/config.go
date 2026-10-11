@@ -3,6 +3,7 @@ package storage
 import (
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"regexp"
 	"strings"
 )
@@ -53,8 +54,9 @@ func RegionFromEndpoint(endpoint string) string {
 
 // StorageConfig holds configuration for any storage provider
 type StorageConfig struct {
-	Provider Provider `yaml:"provider"`
-	Bucket   string   `yaml:"bucket"`
+	Provider     Provider `yaml:"provider"`
+	SharedFolder string   `yaml:"shared_folder,omitempty"`
+	Bucket       string   `yaml:"bucket"`
 
 	// R2/S3 common fields
 	AccessKeyID     string `yaml:"access_key_id,omitempty"`
@@ -86,11 +88,16 @@ type StorageConfig struct {
 
 // Validate checks if the configuration is valid for the selected provider
 func (c *StorageConfig) Validate() error {
-	if c.Provider != ProviderWebDAV && c.Bucket == "" {
+	if c.Provider != ProviderWebDAV && c.Provider != ProviderICloud && c.Bucket == "" {
 		return fmt.Errorf("bucket is required")
 	}
 
 	switch c.Provider {
+	case ProviderICloud:
+		if !filepath.IsAbs(c.SharedFolder) || filepath.Clean(c.SharedFolder) == string(filepath.Separator) {
+			return fmt.Errorf("shared_folder must be an absolute path to an existing dedicated shared folder")
+		}
+		return nil
 	case ProviderR2:
 		return c.validateR2()
 	case ProviderS3:

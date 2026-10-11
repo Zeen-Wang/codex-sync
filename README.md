@@ -22,6 +22,26 @@ codex-sync is a fork of [claude-sync](https://github.com/tawanorg/claude-sync)
 [NOTICE](NOTICE). It is early software (v0.x): macOS, built from source, tested
 by its author on two Macs. Issues and pull requests are welcome.
 
+## iCloud Drive shared folders
+
+Two Macs using different Apple Accounts and different Codex accounts can use an
+explicitly shared iCloud Drive folder with the new `icloud` provider:
+
+```sh
+codex-sync init --provider icloud --shared-folder "/absolute/path/to/shared/Codex Sessions"
+```
+
+Both Macs need edit access and the same encryption passphrase. This provider is
+**sessions-only**: local logins, configuration, keys and databases stay separate.
+It retains immutable encrypted revisions, refuses stale uploads and detects
+visible concurrent branches. Pull-side removals and all remote deletes are disabled.
+Use one Mac at a time, wait for Finder delivery, and pull before editing: iCloud
+has eventual consistency and **no distributed locking**. A local successful push
+is not confirmation of cloud delivery. Existing launchd schedules should be disabled.
+
+See [setup, limitations, recovery and two-Mac acceptance checks](docs/icloud.md).
+
+
 ## Contents
 
 - [How it works](#how-it-works)
