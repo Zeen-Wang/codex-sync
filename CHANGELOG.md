@@ -4,6 +4,8 @@
 
 ### Added
 
+- Chinese README (`README-zh.md`) covering installation, account isolation, iCloud setup and recovery, with language navigation from the English README.
+
 - `icloud` shared-folder provider and `init --shared-folder` setup for separate Apple/Codex accounts. Enforces sessions-only scope and rejects overlap with local Codex data, state or keys.
 - Immutable encrypted revision history, locally conditional session uploads, exact-revision downloads, checksum/ancestry validation, visible-fork detection, local process locking, and `icloud export` for non-destructive recovery.
 - iCloud transport never removes local files based on missing remote listings and refuses remote deletion, including `push --force`. Documents eventual consistency, the absence of cross-Mac locking, explicit folder invitations, handoff and recovery workflows.

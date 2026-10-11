@@ -1,5 +1,7 @@
 # codex-sync
 
+English | [简体中文](README-zh.md)
+
 [![CI](https://github.com/d-jiao/codex-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/d-jiao/codex-sync/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
