@@ -146,7 +146,7 @@ func isCodexExecutable(command string) bool {
 // codex-sync must not hide the very engine holding the databases — so only our
 // own PID is dropped. No match is not an error.
 func runningCodexProcesses() ([]string, error) {
-	out, err := exec.Command("ps", "-axww", "-o", "pid=,comm=").Output()
+	out, err := exec.Command("ps", "-U", strconv.Itoa(os.Getuid()), "-ww", "-o", "pid=,comm=").Output()
 	if err != nil {
 		return nil, fmt.Errorf("ps: %w", err)
 	}
